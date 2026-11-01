@@ -9,6 +9,9 @@
 #include <limits>
 #include <compare>
 
+#undef min
+#undef max
+
 namespace sere {
 	template <typename _Container>
 	class _dynamic_iterator;
@@ -204,24 +207,28 @@ namespace sere {
 		[[no_unique_address]] allocator_type _alloc;
 
 		constexpr void destroy_data() {
-			for (size_type i{}; i < _size + 1; ++i)
-				alloc_traits::destroy(_alloc, &_data[i]);
-
-			_size = {};
+			if (_data)
+				for (size_type i{}; i < _size; ++i)
+					alloc_traits::destroy(_alloc, &_data[i]);
 		}
 
 		constexpr void _deallocate() {
-			alloc_traits::deallocate(_alloc, _data, _capacity);
+			if (_data)
+				alloc_traits::deallocate(_alloc, _data, _capacity);
+
 			_data = {};
+			_capacity = {};
 		}
 
 		constexpr void reallocate(size_type new_cap) {
+			if (new_cap < _size) return;
+
 			pointer tmp_data{ alloc_traits::allocate(_alloc, new_cap) };
 
 			size_type i{};
 			try {
 				for (; i < _size; ++i)
-					alloc_traits::construct(_alloc, &tmp_data[i], _data[i]);
+					alloc_traits::construct(_alloc, &tmp_data[i], std::move_if_noexcept(_data[i]));
 			}
 			catch (...) {
 				for (size_type j{}; j < i; ++j)
@@ -240,15 +247,31 @@ namespace sere {
 			_data = tmp_data;
 		}
 	public:
-		constexpr dynamic()
+		constexpr dynamic() noexcept
 			: _data{}, _size{}, _capacity{}
 		{
 		}
 
-		constexpr explicit dynamic(const size_type cap)
-			: _size{ cap }, _capacity{ cap }, _data{}
+		constexpr explicit dynamic(const size_type capacity)
+			: _size{ capacity }, _capacity{ capacity }, _data{}
 		{
-			_data = alloc_traits::allocate(_alloc, cap);
+			_data = alloc_traits::allocate(_alloc, capacity);
+
+			size_type i{};
+			try {
+				for (; i < _size; ++i)
+					alloc_traits::construct(_alloc, &_data[i], value_type{});
+			}
+			catch (...) {
+				for (size_type j{}; j < i; ++j)
+					alloc_traits::destroy(_alloc, &_data[j]);
+
+				_deallocate();
+
+				_capacity = {};
+
+				throw;
+			}
 		}
 
 		constexpr dynamic(const std::initializer_list<value_type> init)
@@ -265,7 +288,6 @@ namespace sere {
 				for (size_type j{}; j < i; ++j)
 					alloc_traits::destroy(_alloc, &_data[j]);
 
-				destroy_data();
 				_deallocate();
 
 				_capacity = {};
@@ -283,8 +305,10 @@ namespace sere {
 
 			size_type i{};
 			try {
-				for (; i < _size; ++i)
-					alloc_traits::construct(_alloc, &_data[i], range[i]);
+				for (auto begin{ range.begin() }; begin != range.end(); ++begin) {
+					alloc_traits::construct(_alloc, &_data[i], *begin);
+					++i;
+				}
 			}
 			catch (...) {
 				for (size_type j{}; j < i; ++j)
@@ -306,7 +330,7 @@ namespace sere {
 
 			size_type i{};
 			try {
-				for (; i < _size; ++i)
+				for (; i < other._size; ++i)
 					alloc_traits::construct(_alloc, &_data[i], other._data[i]);
 			}
 			catch (...) {
@@ -323,11 +347,12 @@ namespace sere {
 		}
 
 		constexpr dynamic(dynamic&& other) noexcept
-			: _size{ other._size }, _capacity{ other._capacity }, _data{ other._data }
+			: _size{ other._size }, _capacity{ other._capacity }, _data{ other._data }, _alloc{ other._alloc }
 		{
 			other._size = {};
 			other._capacity = {};
 			other._data = {};
+			other._alloc = {};
 		}
 
 		constexpr dynamic& operator=(const dynamic& other) {
@@ -360,6 +385,8 @@ namespace sere {
 					for (size_type j{}; j < i; ++j)
 						alloc_traits::destroy(_alloc, &tmp_data[j]);
 
+					alloc_traits::deallocate(_alloc, tmp_data, other._size);
+
 					throw;
 				}
 
@@ -367,8 +394,7 @@ namespace sere {
 				_data = tmp_data;
 			}
 
-			_size = other._size;
-			_capacity = other._capacity;
+			_size, _capacity = other._size;
 
 			return *this;
 		}
@@ -382,10 +408,12 @@ namespace sere {
 			_data = other._data;
 			_size = other._size;
 			_capacity = other._capacity;
+			_alloc = other._alloc;
 
 			other._size = {};
 			other._capacity = {};
 			other._data = {};
+			other._alloc = {};
 
 			return *this;
 		}
@@ -432,30 +460,30 @@ namespace sere {
 		}
 
 		constexpr void push_back(const_reference value) {
-			if (_size == _capacity) reallocate(!_capacity ? 1 : _capacity + _capacity / 2);
+			if (_size == _capacity) reallocate(!_capacity ? 1 : _capacity * 2);
 
 			try {
 				alloc_traits::construct(_alloc, &_data[_size], value);
-				++_size;
 			}
 			catch (...) {
-				alloc_traits::destroy(_alloc, &_data[_size]);
 				throw;
 			}
+
+			++_size;
 		}
 
 		template <typename... Args>
 		constexpr reference emplace_back(Args&&... args) {
-			if (_size == _capacity) reallocate(!_capacity ? 1 : _capacity + _capacity / 2);
+			if (_size == _capacity) reallocate(!_capacity ? 1 : _capacity * 2);
 
 			try {
 				alloc_traits::construct(_alloc, &_data[_size], std::forward<Args>(args)...);
-				++_size;
 			}
 			catch (...) {
-				alloc_traits::destroy(_alloc, &_data[_size]);
 				throw;
 			}
+
+			++_size;
 
 			return _data[_size - 1];
 		}
@@ -463,8 +491,11 @@ namespace sere {
 		template <typename _Rng>
 			requires std::ranges::range<_Rng>
 		constexpr void append_range(_Rng&& range) {
-			if (_size + range.size() > _capacity) reallocate(range.size());
-			size_type i{};
+			if (range == *this) return;
+
+			if (_size + range.size() > _capacity) reallocate(_size + range.size());
+
+			size_t old_size{ _size };
 
 			for (auto begin{ std::begin(range) }; begin != std::end(range); ++begin) {
 				try {
@@ -472,15 +503,13 @@ namespace sere {
 					++_size;
 				}
 				catch (...) {
-					for (size_type j{}; j < i; ++j) {
-						alloc_traits::destroy(_alloc, &_data[_size]);
+					while (_size > old_size) {
 						--_size;
+						alloc_traits::destroy(_alloc, &_data[_size]);
 					}
 
 					throw;
 				}
-
-				++i;
 			}
 		}
 
@@ -494,7 +523,7 @@ namespace sere {
 		}
 
 		constexpr void shrink_to_fit() {
-			if (_size == 0) {
+			if (!_size) {
 				destroy_data();
 				_deallocate();
 			}
@@ -546,16 +575,18 @@ namespace sere {
 		constexpr void assign(const size_type new_size, const_reference val) {
 			resize(new_size);
 
+			if (!new_size) return;
+
 			size_type i{};
 			try {
-				for (size_type i{}; i < _size; ++i)
-					alloc_traits::construct(_alloc, &_data[i], value_type{});
-
-				alloc_traits::construct(_alloc, &_data[0], val);
+				for (; i < _size; ++i)
+					alloc_traits::construct(_alloc, &_data[i], val);
 			}
 			catch (...) {
-				for (size_type j{}; j < i; ++j)
+				for (size_type j{}; j < i; ++i)
 					alloc_traits::destroy(_alloc, &_data[j]);
+
+				_size = {};
 
 				throw;
 			}
@@ -569,6 +600,8 @@ namespace sere {
 		template <typename _Rng>
 			requires std::ranges::range<_Rng>
 		constexpr void assign_range(_Rng&& range) {
+			if (range == *this) return;
+
 			dynamic tmp{ range };
 			*this = std::move(tmp);
 		}
